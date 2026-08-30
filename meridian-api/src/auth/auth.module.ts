@@ -23,6 +23,7 @@ import { AuditModule } from 'src/audit/audit.module';
 import { Column, Entity, PrimaryColumn, Repository } from 'typeorm';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { Observable, mergeMap, catchError } from 'rxjs';
+import { AccountLockoutService } from './providers/account-lockout.service';
 
 // Entity for idempotency records
 @Entity('auth_idempotency_keys')
@@ -126,6 +127,7 @@ export class AuthIdempotencyInterceptor implements NestInterceptor {
     RefreshTokenProvider,
     { provide: HashingProvider, useClass: BcryptProvider },
     SignInProviders,
+    AccountLockoutService,
     VerifyEmailProvider,
     {
       provide: VerificationTokenProvider,
