@@ -21,6 +21,7 @@ import {
   CheckCircle2,
   Loader2,
   ShieldAlert,
+  ShieldOff,
   TriangleAlert,
   XCircle,
 } from 'lucide-react'
@@ -43,6 +44,7 @@ import {
   useEmergencyTransfer,
   type TransferProvider,
 } from '@/hooks/useEmergencyTransfer'
+import type { TransferCapabilityResolver } from '@/lib/api/transfer-capability'
 import type { EmergencyTransferConfig } from '@/models/emergency-transfer-config'
 import type { ConfirmationPayload } from '@/lib/validations/emergency-transfer'
 
@@ -303,6 +305,13 @@ export interface EmergencyTransferDialogProps {
   provider: TransferProvider
   /** Optional override for "now" — useful in tests. */
   getNow?: () => number
+  /**
+   * Server-derived capability resolver.  When provided, the dialog re-resolves
+   * the capability every time it opens and the hook re-validates it before
+   * binding and before submitting — so a stale or revoked capability cannot
+   * execute, even if the config claim still says "authorised".
+   */
+  capabilityResolver?: TransferCapabilityResolver
 }
 
 export function EmergencyTransferDialog({
@@ -311,6 +320,7 @@ export function EmergencyTransferDialog({
   config,
   provider,
   getNow,
+  capabilityResolver,
 }: EmergencyTransferDialogProps) {
   const {
     state,
@@ -321,9 +331,10 @@ export function EmergencyTransferDialog({
     setRiskAcknowledged,
     bindConfirmation,
     submit,
+    resolveCapability,
     dismiss,
     msUntilExpiry,
-  } = useEmergencyTransfer({ config, provider, getNow })
+  } = useEmergencyTransfer({ config, provider, getNow, capabilityResolver })
 
   // Payload reference for step 2 — only valid after `bindConfirmation` is called.
   const [boundPayload, setBoundPayload] =
@@ -395,7 +406,21 @@ export function EmergencyTransferDialog({
     state.phase === 'expired' ||
     state.phase === 'config_changed' ||
     state.phase === 'unauthorized' ||
+    state.phase === 'capability_revoked' ||
     state.phase === 'dismissed'
+
+  const isCapabilityChecking = state.capabilityState === 'checking'
+  const isCapabilityDenied = state.capabilityState === 'denied'
+
+  // Re-derive the capability from server state each time the dialog opens.
+  // A revoked capability invalidates the whole flow (blocks the review and
+  // any pending confirmation) before the user can interact.
+  React.useEffect(() => {
+    if (open && capabilityResolver) {
+      resolveCapability()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, capabilityResolver])
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -411,6 +436,35 @@ export function EmergencyTransferDialog({
             confirming.
           </DialogDescription>
         </DialogHeader>
+
+        {/* ---- Server-capability notice (issue #1633) ---- */}
+        {capabilityResolver && isCapabilityDenied && (
+          <div
+            className="flex flex-col gap-3"
+            data-testid="et-capability-notice"
+          >
+            <Alert variant="destructive" role="status" aria-live="polite">
+              <ShieldOff className="size-4" aria-hidden />
+              <AlertTitle>Emergency transfer unavailable</AlertTitle>
+              <AlertDescription>
+                Your session does not currently have emergency-transfer
+                capability. The authorisation must be granted before this
+                action can be performed. Contact your administrator.
+              </AlertDescription>
+            </Alert>
+            {!isTerminal && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-fit"
+                onClick={handleDismiss}
+                data-testid="et-capability-dismiss-btn"
+              >
+                Close
+              </Button>
+            )}
+          </div>
+        )}
 
         {/* ---- Gate: show unavailable notice when policy not met ---- */}
         {!isAvailable && state.phase === 'idle' && (
@@ -429,7 +483,9 @@ export function EmergencyTransferDialog({
             onAcknowledgeChange={setRiskAcknowledged}
             onConfirm={handleConfirm}
             onDismiss={handleDismiss}
-            confirmDisabled={!canConfirm}
+            confirmDisabled={!canConfirm || isCapabilityChecking || isCapabilityDenied}
+            capabilityChecking={isCapabilityChecking}
+            capabilityDenied={isCapabilityDenied}
           />
         )}
 
