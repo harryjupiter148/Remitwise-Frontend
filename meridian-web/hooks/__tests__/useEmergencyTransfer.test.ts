@@ -26,13 +26,12 @@ import type { ConfirmationPayload } from '@/lib/validations/emergency-transfer'
 // Helpers
 // ---------------------------------------------------------------------------
 
-const FUTURE = Date.now() + 10 * 60 * 1000 // 10 min from now
-
 function makeConfig(
   overrides: Partial<Omit<EmergencyTransferConfig, 'configId' | 'createdAt'>> = {},
 ): EmergencyTransferConfig {
+  const defaultExpiresAt = Date.now() + 10 * 60 * 1000
   return createEmergencyTransferConfig({
-    expiresAt: FUTURE,
+    expiresAt: defaultExpiresAt,
     recipient: '0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF',
     amountRaw: '1000000000000000000',
     amountDisplay: '1.0',
@@ -47,6 +46,7 @@ function makeConfig(
   })
 }
 
+
 const successProvider = vi.fn(async (_p: ConfirmationPayload) => ({
   txHash: '0xabc123',
 }))
@@ -55,23 +55,31 @@ const rejectProvider = vi.fn(async (_p: ConfirmationPayload): Promise<{ txHash: 
   throw Object.assign(new Error('Insufficient funds'), { code: 'INSUFFICIENT_FUNDS' })
 })
 
+interface SetupProps {
+  cfg?: EmergencyTransferConfig | null
+  prov?: typeof successProvider
+  now?: () => number
+}
+
 function setup(
   config: EmergencyTransferConfig | null,
   provider = successProvider,
   getNow?: () => number,
 ) {
   return renderHook(
-    ({ cfg, prov, now }: {
-      cfg: EmergencyTransferConfig | null
-      prov: typeof successProvider
-      now?: () => number
-    }) =>
-      useEmergencyTransfer({ config: cfg, provider: prov, getNow: now }),
+    (props: SetupProps) =>
+      useEmergencyTransfer({
+        config: props.cfg ?? null,
+        provider: props.prov ?? successProvider,
+        getNow: props.now,
+      }),
     {
       initialProps: { cfg: config, prov: provider, now: getNow },
     },
   )
 }
+
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -228,11 +236,10 @@ describe('useEmergencyTransfer', () => {
 
       const drifted = makeConfig({
         recipient: '0x1111111111111111111111111111111111111111',
-        expiresAt: FUTURE,
       })
 
       // Simulate parent updating the config prop
-      rerender({ cfg: drifted, prov: successProvider })
+      rerender({ cfg: drifted, prov: successProvider, now: undefined })
 
       // Allow effects to flush
       await act(async () => { await Promise.resolve() })
@@ -249,7 +256,7 @@ describe('useEmergencyTransfer', () => {
       act(() => { result.current.bindConfirmation() })
 
       const drifted = makeConfig({ amountRaw: '2000000000000000000' })
-      rerender({ cfg: drifted, prov: successProvider })
+      rerender({ cfg: drifted, prov: successProvider, now: undefined })
       await act(async () => { await Promise.resolve() })
 
       expect(result.current.state.phase).toBe('config_changed')
@@ -263,7 +270,7 @@ describe('useEmergencyTransfer', () => {
       act(() => { result.current.bindConfirmation() })
 
       const drifted = makeConfig({ networkId: 'polygon' })
-      rerender({ cfg: drifted, prov: successProvider })
+      rerender({ cfg: drifted, prov: successProvider, now: undefined })
       await act(async () => { await Promise.resolve() })
 
       expect(result.current.state.phase).toBe('config_changed')
@@ -278,7 +285,8 @@ describe('useEmergencyTransfer', () => {
 
       // Drift the config prop but skip the effect by not awaiting
       const drifted = makeConfig({ recipient: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' })
-      rerender({ cfg: drifted, prov: successProvider })
+      rerender({ cfg: drifted, prov: successProvider, now: undefined })
+
 
       // Submit before the effect fires
       await act(async () => { await result.current.submit() })
@@ -453,10 +461,15 @@ describe('useEmergencyTransfer', () => {
       act(() => { result.current.bindConfirmation() })
 
       // Fire first submit (pending)
-      const firstSubmit = act(async () => { await result.current.submit() })
+      let p1!: Promise<void>
+      act(() => {
+        p1 = result.current.submit()
+      })
 
       // Fire second submit while first is in flight
-      await act(async () => { await result.current.submit() })
+      act(() => {
+        result.current.submit()
+      })
 
       // DUPLICATE_BLOCKED event must have been emitted
       expect(
@@ -466,9 +479,10 @@ describe('useEmergencyTransfer', () => {
       // Resolve first submit
       await act(async () => {
         resolveFirst({ txHash: '0xabc' })
-        await firstSubmit
+        await p1
       })
     })
+
   })
 
   // -------------------------------------------------------------------------
@@ -1149,3 +1163,4 @@ describe('useEmergencyTransfer', () => {
     })
   })
 })
+
