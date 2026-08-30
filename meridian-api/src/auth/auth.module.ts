@@ -22,6 +22,7 @@ import { CryptoModule } from 'src/crypto/crypto.module';
 import { Column, Entity, PrimaryColumn } from 'typeorm';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { Observable, mergeMap, catchError } from 'rxjs';
+import { AccountLockoutService } from './providers/account-lockout.service';
 
 // Entity for idempotency records
 @Entity('auth_idempotency_keys')
@@ -126,6 +127,7 @@ wtConfig),
     RefreshTokenProvider,
     { provide: HashingProvider, useClass: BcryptProvider },
     SignInProviders,
+    AccountLockoutService,
     VerifyEmailProvider,
     {
       provide: VerificationTokenProvider,
