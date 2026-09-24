@@ -79,6 +79,15 @@ impl<'a> Verifier<'a> {
     pub fn verify(&self, token: &AccessToken) -> Result<AccessToken, AuthError> {
         self.store.verify_access(token)
     }
+
+    /// Verify an access token for an expected subject (tenant isolation).
+    pub fn verify_for_subject(
+        &self,
+        token: &AccessToken,
+        expected_subject: &str,
+    ) -> Result<AccessToken, AuthError> {
+        self.store.verify_access_for_subject(token, expected_subject)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +156,17 @@ impl AuthService {
         password: &str,
         balance_stroops: Option<u64>,
     ) -> Result<LoginResult, AuthError> {
-        // -- Amount validation first (before any state change) -----
+        // -- Subject validation first (before any state change) -----
+        if subject.is_empty() {
+            return Err(AuthError::ValidationError("subject must not be empty".into()));
+        }
+        if subject.len() > 256 {
+            return Err(AuthError::ValidationError(
+                "subject exceeds maximum length of 256".into(),
+            ));
+        }
+
+        // -- Amount validation (before any state change) -----
         let balance = if let Some(stroops) = balance_stroops {
             Some(
                 Amount::new(stroops)
@@ -234,34 +253,33 @@ impl AuthService {
     /// A failure in either step rolls back the other, so callers never
     /// observe a partially-logged-out session.
     pub fn logout(&mut self, session_id: u64) -> Result<(), AuthError> {
-        let session = self
-            .sessions
-            .get(&session_id)
-            .ok_or(AuthError::SessionNotFound)?;
+        let (access_id, refresh_id, session_superseded) = {
+            let session = self
+                .sessions
+                .get(&session_id)
+                .ok_or(AuthError::SessionNotFound)?;
+            (
+                session.tokens.access.id,
+                session.tokens.refresh.id,
+                session.superseded,
+            )
+        };
 
         // Snapshot both stores so we can roll back on failure.
         let token_snapshot = self.store.snapshot();
-        let session_superseded = self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.superseded);
 
-        self.store.revoke(session.tokens.access.id);
-        self.store.revoke(session.tokens.refresh.id);
+        self.store.revoke(access_id);
+        self.store.revoke(refresh_id);
 
         if let Some(s) = self.sessions.get_mut(&session_id) {
             s.superseded = true;
         }
 
         // Validate that revocation succeeded — if not, roll back.
-        if !self.store.is_revoked(session.tokens.access.id)
-            || !self.store.is_revoked(session.tokens.refresh.id)
-        {
+        if !self.store.is_revoked(access_id) || !self.store.is_revoked(refresh_id) {
             self.store.restore(token_snapshot);
-            if let Some(superseded) = session_superseded {
-                if let Some(s) = self.sessions.get_mut(&session_id) {
-                    s.superseded = superseded;
-                }
+            if let Some(s) = self.sessions.get_mut(&session_id) {
+                s.superseded = session_superseded;
             }
             return Err(AuthError::InternalError(
                 "logout partial failure, rolled back".into(),
@@ -269,6 +287,21 @@ impl AuthService {
         }
 
         Ok(())
+    }
+
+    /// Log out a single session if and only if it belongs to `subject`.
+    /// Rejects cross-tenant logout requests before any revocation or mutation.
+    pub fn logout_for_subject(&mut self, subject: &str, session_id: u64) -> Result<(), AuthError> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(AuthError::SessionNotFound)?;
+
+        if session.subject != subject {
+            return Err(AuthError::ValidationError("session subject mismatch".into()));
+        }
+
+        self.logout(session_id)
     }
 
     /// Log out all sessions for a subject (e.g. "log out everywhere").
@@ -341,49 +374,98 @@ impl AuthService {
         Ok(verified.subject)
     }
 
+    /// Verify an access token for an expected subject (tenant isolation).
+    pub fn verify_token_for_subject(
+        &self,
+        token: &AccessToken,
+        expected_subject: &str,
+    ) -> Result<String, AuthError> {
+        let verified = self.store.verify_access_for_subject(token, expected_subject)?;
+        Ok(verified.subject)
+    }
+
     // -- Refresh (via token store) ----------------------------------------
 
     /// Refresh a session's tokens.
     ///
-    /// # Atomic rollback
+    /// # Multi-tab / multi-device safety
     ///
-    /// After a successful token rotation the session record is updated
-    /// to hold the new token pair.  If the session update fails after
-    /// token rotation, the token store is rolled back to its pre-refresh
-    /// snapshot so the old tokens remain valid.
+    /// When multiple tabs or devices are active, each session maintains
+    /// its own token pair.  Refreshing a specific session updates *only*
+    /// that session and revokes its prior tokens without invalidating
+    /// concurrent sessions.
+    ///
+    /// Replay of an already-rotated refresh token revokes all tokens
+    /// for that user and marks their sessions superseded.
     pub fn refresh_session(
         &mut self,
         refresh_token: &RefreshToken,
     ) -> Result<TokenPair, AuthError> {
-        // Snapshot the token store before rotation.
-        let token_snapshot = self.store.snapshot();
-        let session_snapshots: Vec<(u64, TokenPair)> = self
-            .sessions
-            .values()
-            .filter(|s| s.subject == refresh_token.subject && !s.superseded)
-            .map(|s| (s.id, s.tokens.clone()))
-            .collect();
-
-        let new_pair = self.store.refresh(refresh_token)?;
-
-        // Update session records to hold the new tokens.
-        let mut updated_any = false;
-        for (session_id, _) in &session_snapshots {
-            if let Some(session) = self.sessions.get_mut(session_id) {
-                session.tokens = new_pair.clone();
-                session.last_activity_at = Self::now_secs();
-                updated_any = true;
-            }
+        if refresh_token.subject.is_empty() {
+            return Err(AuthError::ValidationError("subject must not be empty".into()));
         }
 
-        // If the session update failed to apply to any session, roll back
-        // the token store so old tokens remain usable.
-        if !updated_any && !session_snapshots.is_empty() {
-            self.store.restore(token_snapshot);
-            for (session_id, old_tokens) in &session_snapshots {
-                if let Some(session) = self.sessions.get_mut(session_id) {
-                    session.tokens = old_tokens.clone();
+        // Find the specific session associated with this refresh token.
+        let matching_session_id = self
+            .sessions
+            .values()
+            .find(|s| s.tokens.refresh.id == refresh_token.id)
+            .map(|s| (s.id, s.subject.clone(), s.superseded))
+            .or_else(|| {
+                self.sessions
+                    .values()
+                    .find(|s| s.subject == refresh_token.subject && !s.superseded)
+                    .map(|s| (s.id, s.subject.clone(), s.superseded))
+            });
+
+        let (session_id, session_subject, session_superseded) = match matching_session_id {
+            Some(info) => info,
+            None => {
+                let has_superseded = self
+                    .sessions
+                    .values()
+                    .any(|s| s.subject == refresh_token.subject && s.superseded);
+                if has_superseded {
+                    return Err(AuthError::SessionSuperseded);
                 }
+                return Err(AuthError::SessionNotFound);
+            }
+        };
+
+        if session_superseded {
+            return Err(AuthError::SessionSuperseded);
+        }
+
+        if session_subject != refresh_token.subject {
+            return Err(AuthError::ValidationError("session subject mismatch".into()));
+        }
+
+        // Snapshot token store and target session before rotation.
+        let token_snapshot = self.store.snapshot();
+        let old_session_tokens = self.sessions.get(&session_id).unwrap().tokens.clone();
+
+        let new_pair = match self.store.refresh(refresh_token) {
+            Ok(pair) => pair,
+            Err(AuthError::TokenAlreadyUsed) => {
+                // Replay detected: supersede all sessions for this subject.
+                for s in self.sessions.values_mut() {
+                    if s.subject == refresh_token.subject {
+                        s.superseded = true;
+                    }
+                }
+                return Err(AuthError::TokenAlreadyUsed);
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Update target session record to hold the new tokens.
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.tokens = new_pair.clone();
+            session.last_activity_at = Self::now_secs();
+        } else {
+            self.store.restore(token_snapshot);
+            if let Some(s) = self.sessions.get_mut(&session_id) {
+                s.tokens = old_session_tokens;
             }
             return Err(AuthError::InternalError(
                 "refresh session update failed, rolled back".into(),
@@ -391,6 +473,20 @@ impl AuthService {
         }
 
         Ok(new_pair)
+    }
+
+    /// Refresh a session specifically asserting expected subject (tenant isolation).
+    pub fn refresh_session_for_subject(
+        &mut self,
+        expected_subject: &str,
+        refresh_token: &RefreshToken,
+    ) -> Result<TokenPair, AuthError> {
+        if refresh_token.subject != expected_subject {
+            return Err(AuthError::ValidationError(
+                "cross-tenant refresh rejected".into(),
+            ));
+        }
+        self.refresh_session(refresh_token)
     }
 
     // -- Accessors --------------------------------------------------------
@@ -698,5 +794,93 @@ mod tests {
 
         // No sessions created.
         assert_eq!(auth.session_count(), session_count_before);
+    }
+
+    #[test]
+    fn logout_for_subject_rejects_cross_tenant_without_mutation() {
+        let mut auth = setup();
+        let lr_alice = auth.login("alice".into(), "password", None).unwrap();
+        let _lr_bob = auth.login("bob".into(), "password", None).unwrap();
+
+        // Bob tries to log out Alice's session
+        let res = auth.logout_for_subject("bob", lr_alice.session.id);
+        assert_eq!(
+            res,
+            Err(AuthError::ValidationError("session subject mismatch".into()))
+        );
+
+        // Verification of zero mutation: Alice's session and tokens are completely untouched
+        assert!(!auth.sessions.get(&lr_alice.session.id).unwrap().superseded);
+        assert!(!auth.store().is_revoked(lr_alice.tokens.access.id));
+        assert!(!auth.store().is_revoked(lr_alice.tokens.refresh.id));
+        assert!(auth.verify_token_for_subject(&lr_alice.tokens.access, "alice").is_ok());
+    }
+
+    #[test]
+    fn refresh_session_for_subject_rejects_cross_tenant_without_mutation() {
+        let mut auth = setup();
+        let lr_alice = auth.login("alice".into(), "password", None).unwrap();
+
+        // Bob tries to refresh Alice's token claiming to be Bob
+        let res = auth.refresh_session_for_subject("bob", &lr_alice.tokens.refresh);
+        assert_eq!(
+            res,
+            Err(AuthError::ValidationError("cross-tenant refresh rejected".into()))
+        );
+
+        // Alice's tokens and session remain intact
+        assert!(!auth.store().is_revoked(lr_alice.tokens.access.id));
+        assert!(!auth.store().is_revoked(lr_alice.tokens.refresh.id));
+        assert!(!auth.sessions.get(&lr_alice.session.id).unwrap().superseded);
+    }
+
+    #[test]
+    fn multi_tab_refresh_independence() {
+        let mut auth = setup();
+        // Alice opens two tabs concurrently
+        let tab1 = auth.login("alice".into(), "password", None).unwrap();
+        let tab2 = auth.login("alice".into(), "password", None).unwrap();
+
+        // Tab 1 refreshes its session
+        let tab1_refreshed = auth.refresh_session(&tab1.tokens.refresh).unwrap();
+
+        // Tab 1's session was updated and old tokens revoked
+        assert!(auth.store().is_revoked(tab1.tokens.access.id));
+        assert!(auth.store().is_revoked(tab1.tokens.refresh.id));
+        assert!(auth.verify_token_for_subject(&tab1_refreshed.access, "alice").is_ok());
+
+        // Tab 2's tokens MUST still be valid and active across tabs
+        assert!(!auth.store().is_revoked(tab2.tokens.access.id));
+        assert!(!auth.store().is_revoked(tab2.tokens.refresh.id));
+        assert!(auth.verify_token_for_subject(&tab2.tokens.access, "alice").is_ok());
+
+        // Tab 2 can now refresh independently without issue
+        let tab2_refreshed = auth.refresh_session(&tab2.tokens.refresh).unwrap();
+        assert!(auth.verify_token_for_subject(&tab2_refreshed.access, "alice").is_ok());
+    }
+
+    #[test]
+    fn login_subject_validation_enforces_bounds_without_mutation() {
+        let mut auth = setup();
+        let count_before = auth.session_count();
+
+        // Empty subject
+        let res_empty = auth.login("".into(), "password", None);
+        assert_eq!(
+            res_empty,
+            Err(AuthError::ValidationError("subject must not be empty".into()))
+        );
+
+        // Oversized subject (> 256 chars)
+        let long_subject = "a".repeat(257);
+        let res_long = auth.login(long_subject, "password", None);
+        assert_eq!(
+            res_long,
+            Err(AuthError::ValidationError("subject exceeds maximum length of 256".into()))
+        );
+
+        // Zero side effects
+        assert_eq!(auth.session_count(), count_before);
+        assert_eq!(auth.store().active_access_count(), 0);
     }
 }

@@ -1,0 +1,60 @@
+   0.283951600s  INFO prepare_target{force=false package_id=meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api) target="meridian_api"}: cargo::core::compiler::fingerprint: fingerprint error for meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("meridian_api", ["lib"], "C:\\Users\\Harold Ikechukwu\\Documents\\drips-wave\\Remitwise-Frontend\\meridian-api\\src\\lib.rs", Edition2021) }
+   0.286606000s  INFO prepare_target{force=false package_id=meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api) target="meridian_api"}: cargo::core::compiler::fingerprint:     err: failed to read `C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api\target\debug\.fingerprint\meridian-api-dbba7e955902e811\lib-meridian_api`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+   0.326865900s  INFO prepare_target{force=false package_id=meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api) target="meridian_api"}: cargo::core::compiler::fingerprint: fingerprint error for meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("meridian_api", ["lib"], "C:\\Users\\Harold Ikechukwu\\Documents\\drips-wave\\Remitwise-Frontend\\meridian-api\\src\\lib.rs", Edition2021) }
+   0.326926800s  INFO prepare_target{force=false package_id=meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api) target="meridian_api"}: cargo::core::compiler::fingerprint:     err: failed to read `C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api\target\debug\.fingerprint\meridian-api-5fd577a46c99ccce\test-lib-meridian_api`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+    Checking meridian-api v0.1.0 (C:\Users\Harold Ikechukwu\Documents\drips-wave\Remitwise-Frontend\meridian-api)
+error: could not compile `meridian-api` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `meridian-api` (lib test) due to 1 previous error

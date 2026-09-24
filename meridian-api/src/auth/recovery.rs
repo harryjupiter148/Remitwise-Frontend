@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::errors::AuthError;
 use super::tokens::{TokenPair, TokenStore};
+use super::validation::{validate_session_id, validate_subject};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -155,6 +156,9 @@ impl RecoveryService {
         subject: String,
         session_id: u64,
     ) -> Result<RecoveryToken, AuthError> {
+        validate_subject(&subject)?;
+        validate_session_id(session_id)?;
+
         // Check for existing request for this session.
         let existing: Option<RecoveryRequest> = self
             .requests
@@ -163,6 +167,11 @@ impl RecoveryService {
             .cloned();
 
         if let Some(req) = existing {
+            // Tenant isolation: session recovery must match session subject
+            if req.subject != subject {
+                return Err(AuthError::ValidationError("session subject mismatch".into()));
+            }
+
             match req.status {
                 RecoveryStatus::Completed => {
                     return Err(AuthError::RecoveryAlreadyCompleted);
@@ -171,9 +180,8 @@ impl RecoveryService {
                     // Allow re-request after cancellation.
                 }
                 RecoveryStatus::Pending => {
-                    // Idempotent — return existing token.
+                    // Idempotent — return existing token if valid.
                     if let Some(token) = &req.token {
-                        // Check if still valid.
                         let now = Self::now_secs();
                         if token.expires_at > now {
                             return Ok(token.clone());
@@ -231,7 +239,7 @@ impl RecoveryService {
     ) -> Result<RecoveryResult, AuthError> {
         let now = Self::now_secs();
 
-        // -- Validate token -----------------------------------------------
+        // -- Validate token existence and replay --------------------------
         if !self.active_tokens.contains_key(&recovery_token.id) {
             if self.used_tokens.contains_key(&recovery_token.id) {
                 return Err(AuthError::TokenAlreadyUsed);
@@ -239,11 +247,35 @@ impl RecoveryService {
             return Err(AuthError::RecoveryTokenInvalid);
         }
 
-        // Check expiry.
+        // -- Validate token integrity against server-stored token --------
+        let stored_token = self
+            .tokens
+            .get(&recovery_token.id)
+            .ok_or(AuthError::RecoveryTokenInvalid)?;
+        if stored_token.subject != recovery_token.subject
+            || stored_token.session_id != recovery_token.session_id
+        {
+            return Err(AuthError::RecoveryTokenInvalid);
+        }
+
+        // -- Check expiry -------------------------------------------------
         if recovery_token.expires_at <= now {
             self.active_tokens.remove(&recovery_token.id);
             return Err(AuthError::TokenExpired);
         }
+
+        // -- Find and validate matching pending request -------------------
+        let req_id = self
+            .requests
+            .values()
+            .find(|r| {
+                r.session_id == recovery_token.session_id
+                    && r.subject == recovery_token.subject
+                    && r.status == RecoveryStatus::Pending
+                    && r.token.as_ref().map(|t| t.id) == Some(recovery_token.id)
+            })
+            .map(|r| r.id)
+            .ok_or(AuthError::RecoveryTokenInvalid)?;
 
         // -- Snapshot recovery-service state for rollback ----------------
         let recovery_snapshot = RecoverySnapshot {
@@ -264,19 +296,9 @@ impl RecoveryService {
         self.active_tokens.remove(&recovery_token.id);
         self.used_tokens.insert(recovery_token.id, true);
 
-        // -- Find and update the request ----------------------------------
-        let request_id = self
-            .requests
-            .values()
-            .find(|r| {
-                r.session_id == recovery_token.session_id && r.status == RecoveryStatus::Pending
-            })
-            .map(|r| r.id);
-
-        if let Some(req_id) = request_id {
-            if let Some(req) = self.requests.get_mut(&req_id) {
-                req.status = RecoveryStatus::Completed;
-            }
+        // -- Update the request status -----------------------------------
+        if let Some(req) = self.requests.get_mut(&req_id) {
+            req.status = RecoveryStatus::Completed;
         }
 
         // -- Revoke all other sessions for this subject ------------------
@@ -314,6 +336,32 @@ impl RecoveryService {
             .requests
             .values_mut()
             .find(|r| r.session_id == session_id && r.status == RecoveryStatus::Pending);
+
+        if let Some(req) = request {
+            req.status = RecoveryStatus::Cancelled;
+            if let Some(token) = &req.token {
+                self.active_tokens.remove(&token.id);
+            }
+            Ok(())
+        } else {
+            Err(AuthError::RecoveryTokenInvalid)
+        }
+    }
+
+    /// Cancel a recovery request for a specific subject (tenant isolation).
+    pub fn cancel_recovery_for_subject(
+        &mut self,
+        subject: &str,
+        session_id: u64,
+    ) -> Result<(), AuthError> {
+        let request = self
+            .requests
+            .values_mut()
+            .find(|r| {
+                r.session_id == session_id
+                    && r.subject == subject
+                    && r.status == RecoveryStatus::Pending
+            });
 
         if let Some(req) = request {
             req.status = RecoveryStatus::Cancelled;
@@ -542,5 +590,102 @@ mod tests {
         // No state changes.
         assert_eq!(svc.active_tokens.len(), active_before);
         assert_eq!(svc.used_tokens.len(), used_before);
+    }
+
+    #[test]
+    fn request_recovery_rejects_cross_tenant_session_hijacking() {
+        let mut svc = setup();
+        let alice_token = svc.request_recovery("alice".into(), 1).unwrap().clone();
+
+        // Bob tries to hijack Alice's session recovery
+        let res = svc.request_recovery("bob".into(), 1);
+        assert_eq!(
+            res,
+            Err(AuthError::ValidationError("session subject mismatch".into()))
+        );
+
+        // Alice's recovery request is still intact and pending
+        let req = svc.requests.values().find(|r| r.session_id == 1).unwrap();
+        assert_eq!(req.status, RecoveryStatus::Pending);
+        assert_eq!(req.token.as_ref().unwrap().id, alice_token.id);
+    }
+
+    #[test]
+    fn complete_recovery_rejects_tampered_subject_without_mutation() {
+        let mut svc = setup();
+        let mut store = TokenStore::new();
+        let alice_pair = store.issue_pair("alice".into());
+
+        let token = svc.request_recovery("alice".into(), 1).unwrap().clone();
+
+        // Forged recovery token with altered subject
+        let mut forged_token = token.clone();
+        forged_token.subject = "mallory".into();
+
+        let res = svc.complete_recovery(&forged_token, &mut store);
+        assert_eq!(res, Err(AuthError::RecoveryTokenInvalid));
+
+        // Zero mutation: token remains active, Alice's tokens are NOT revoked
+        assert!(svc.active_tokens.contains_key(&token.id));
+        assert!(!svc.used_tokens.contains_key(&token.id));
+        assert!(!store.is_revoked(alice_pair.access.id));
+        assert!(!store.is_revoked(alice_pair.refresh.id));
+    }
+
+    #[test]
+    fn complete_recovery_rejects_tampered_session_without_mutation() {
+        let mut svc = setup();
+        let mut store = TokenStore::new();
+        let alice_pair = store.issue_pair("alice".into());
+
+        let token = svc.request_recovery("alice".into(), 1).unwrap().clone();
+
+        // Forged recovery token with altered session_id
+        let mut forged_token = token.clone();
+        forged_token.session_id = 999;
+
+        let res = svc.complete_recovery(&forged_token, &mut store);
+        assert_eq!(res, Err(AuthError::RecoveryTokenInvalid));
+
+        // Zero mutation: token remains active, Alice's tokens are NOT revoked
+        assert!(svc.active_tokens.contains_key(&token.id));
+        assert!(!svc.used_tokens.contains_key(&token.id));
+        assert!(!store.is_revoked(alice_pair.access.id));
+    }
+
+    #[test]
+    fn cancel_recovery_for_subject_rejects_cross_tenant_cancellation() {
+        let mut svc = setup();
+        let token = svc.request_recovery("alice".into(), 1).unwrap().clone();
+
+        // Bob tries to cancel Alice's recovery request
+        let res = svc.cancel_recovery_for_subject("bob", 1);
+        assert_eq!(res, Err(AuthError::RecoveryTokenInvalid));
+
+        // Alice's recovery request is still Pending and active
+        let req = svc.requests.values().find(|r| r.session_id == 1).unwrap();
+        assert_eq!(req.status, RecoveryStatus::Pending);
+        assert!(svc.active_tokens.contains_key(&token.id));
+    }
+
+    #[test]
+    fn request_recovery_validates_subject_and_session() {
+        let mut svc = setup();
+
+        // Empty subject rejected
+        assert_eq!(
+            svc.request_recovery("".into(), 1),
+            Err(AuthError::ValidationError("subject must not be empty".into()))
+        );
+
+        // Zero session_id rejected
+        assert_eq!(
+            svc.request_recovery("alice".into(), 0),
+            Err(AuthError::ValidationError("session id must be positive".into()))
+        );
+
+        // Zero state mutation
+        assert_eq!(svc.requests.len(), 0);
+        assert_eq!(svc.active_tokens.len(), 0);
     }
 }

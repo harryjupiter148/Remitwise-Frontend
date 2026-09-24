@@ -21,7 +21,7 @@
 //! floating-point representation.  The caller must validate through
 //! [`crate::amount::Amount`] before embedding.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::errors::AuthError;
@@ -101,6 +101,8 @@ pub struct TokenStoreSnapshot {
     active_access: HashSet<TokenId>,
     active_refresh: HashSet<TokenId>,
     revoked: HashSet<TokenId>,
+    token_subjects: HashMap<TokenId, String>,
+    paired_access: HashMap<TokenId, TokenId>,
     next_id: TokenId,
 }
 
@@ -118,6 +120,10 @@ pub struct TokenStore {
     active_refresh: HashSet<TokenId>,
     /// Revoked token ids (log — never deleted, prevents replay).
     revoked: HashSet<TokenId>,
+    /// Subject mapping for each issued token id (tenant isolation boundary).
+    token_subjects: HashMap<TokenId, String>,
+    /// Maps refresh token id to paired access token id for tab-isolated rotation.
+    paired_access: HashMap<TokenId, TokenId>,
     /// Monotonic id counter.
     next_id: TokenId,
     /// Access-token lifetime.
@@ -133,6 +139,8 @@ impl TokenStore {
             active_access: HashSet::new(),
             active_refresh: HashSet::new(),
             revoked: HashSet::new(),
+            token_subjects: HashMap::new(),
+            paired_access: HashMap::new(),
             next_id: 1,
             access_lifetime: DEFAULT_ACCESS_TOKEN_LIFETIME,
             refresh_lifetime: DEFAULT_REFRESH_TOKEN_LIFETIME,
@@ -145,6 +153,8 @@ impl TokenStore {
             active_access: HashSet::new(),
             active_refresh: HashSet::new(),
             revoked: HashSet::new(),
+            token_subjects: HashMap::new(),
+            paired_access: HashMap::new(),
             next_id: 1,
             access_lifetime: access,
             refresh_lifetime: refresh,
@@ -177,15 +187,18 @@ impl TokenStore {
             balance_stroops: None,
         };
         self.active_access.insert(access.id);
+        self.token_subjects.insert(access.id, subject.clone());
 
         let refresh = RefreshToken {
             id: self.next_token_id(),
-            subject,
+            subject: subject.clone(),
             issued_at: now,
             expires_at: now.saturating_add(self.refresh_lifetime.as_secs()),
             previous_id: None,
         };
         self.active_refresh.insert(refresh.id);
+        self.token_subjects.insert(refresh.id, subject);
+        self.paired_access.insert(refresh.id, access.id);
 
         TokenPair { access, refresh }
     }
@@ -198,11 +211,29 @@ impl TokenStore {
         if !self.active_access.contains(&token.id) {
             return Err(AuthError::TokenInvalid("unknown token id".into()));
         }
+        if let Some(expected_sub) = self.token_subjects.get(&token.id) {
+            if expected_sub != &token.subject {
+                return Err(AuthError::TokenInvalid("token subject mismatch".into()));
+            }
+        }
         let now = Self::now_secs();
         if token.expires_at <= now {
             return Err(AuthError::TokenExpired);
         }
         Ok(token.clone())
+    }
+
+    /// Verify an access token specifically for an expected subject.
+    /// Rejects cross-tenant or mismatched identities before returning.
+    pub fn verify_access_for_subject(
+        &self,
+        token: &AccessToken,
+        expected_subject: &str,
+    ) -> Result<AccessToken, AuthError> {
+        if token.subject != expected_subject {
+            return Err(AuthError::TokenInvalid("subject mismatch".into()));
+        }
+        self.verify_access(token)
     }
 
     /// Refresh an access token.  Issues a new pair and revokes the old
@@ -230,6 +261,13 @@ impl TokenStore {
             return Err(AuthError::TokenInvalid("unknown refresh token".into()));
         }
 
+        // Verify subject binding to prevent cross-tenant refresh attempts.
+        if let Some(expected_sub) = self.token_subjects.get(&old_refresh.id) {
+            if expected_sub != &old_refresh.subject {
+                return Err(AuthError::TokenInvalid("refresh token subject mismatch".into()));
+            }
+        }
+
         // Check expiry.
         if old_refresh.expires_at <= now {
             return Err(AuthError::TokenExpired);
@@ -242,10 +280,13 @@ impl TokenStore {
         self.active_refresh.remove(&old_refresh.id);
         self.revoked.insert(old_refresh.id);
 
-        // Also revoke the old access token.
-        // (In production you'd look it up by subject; here we track the
-        // most recent one.)
-        self.revoke_all_access_for_subject(&old_refresh.subject);
+        // Also revoke the paired old access token (or all access tokens for subject if unmapped).
+        if let Some(old_access_id) = self.paired_access.remove(&old_refresh.id) {
+            self.active_access.remove(&old_access_id);
+            self.revoked.insert(old_access_id);
+        } else {
+            self.revoke_all_access_for_subject(&old_refresh.subject);
+        }
 
         // Issue new pair.
         // If this fails (e.g. id overflow), roll back to the snapshot
@@ -271,13 +312,21 @@ impl TokenStore {
     }
 
     /// Revoke all tokens for a subject (full logout / device compromise).
+    /// Enforces strict tenant isolation: only tokens belonging to `subject` are revoked.
     pub fn revoke_all_for_subject(&mut self, subject: &str) {
-        // Collect first to avoid borrow issues.
-        let access_ids: Vec<TokenId> = self.active_access.iter().copied().collect(); // simplified — production tracks subject mapping
-        let refresh_ids: Vec<TokenId> = self.active_refresh.iter().copied().collect();
+        let access_ids: Vec<TokenId> = self
+            .active_access
+            .iter()
+            .filter(|&&id| self.token_subjects.get(&id).map(String::as_str) == Some(subject))
+            .copied()
+            .collect();
+        let refresh_ids: Vec<TokenId> = self
+            .active_refresh
+            .iter()
+            .filter(|&&id| self.token_subjects.get(&id).map(String::as_str) == Some(subject))
+            .copied()
+            .collect();
 
-        // In a real store you'd filter by subject.  Here we revoke all
-        // for simplicity since all tokens share the same subject in tests.
         for id in access_ids {
             self.active_access.remove(&id);
             self.revoked.insert(id);
@@ -285,12 +334,17 @@ impl TokenStore {
         for id in refresh_ids {
             self.active_refresh.remove(&id);
             self.revoked.insert(id);
+            self.paired_access.remove(&id);
         }
-        let _ = subject; // suppress unused warning in simplified impl
     }
 
-    fn revoke_all_access_for_subject(&mut self, _subject: &str) {
-        let ids: Vec<TokenId> = self.active_access.iter().copied().collect();
+    fn revoke_all_access_for_subject(&mut self, subject: &str) {
+        let ids: Vec<TokenId> = self
+            .active_access
+            .iter()
+            .filter(|&&id| self.token_subjects.get(&id).map(String::as_str) == Some(subject))
+            .copied()
+            .collect();
         for id in ids {
             self.active_access.remove(&id);
             self.revoked.insert(id);
@@ -300,11 +354,20 @@ impl TokenStore {
     /// Retrieve all active access token ids for a subject.
     /// Returns only token ids whose subject matches.
     pub fn active_access_ids_for_subject(&self, subject: &str) -> Vec<TokenId> {
-        // In a production store this would query by subject index.
-        // Here we return all active access ids (all tokens share
-        // the subject in tests).
-        let _ = subject;
-        self.active_access.iter().copied().collect()
+        self.active_access
+            .iter()
+            .filter(|&&id| self.token_subjects.get(&id).map(String::as_str) == Some(subject))
+            .copied()
+            .collect()
+    }
+
+    /// Retrieve all active refresh token ids for a subject.
+    pub fn active_refresh_ids_for_subject(&self, subject: &str) -> Vec<TokenId> {
+        self.active_refresh
+            .iter()
+            .filter(|&&id| self.token_subjects.get(&id).map(String::as_str) == Some(subject))
+            .copied()
+            .collect()
     }
 
     /// Retrieve all active refresh token ids.
@@ -312,6 +375,10 @@ impl TokenStore {
         self.active_refresh.iter().copied().collect()
     }
 
+    /// Look up the subject registered for a token id, if any.
+    pub fn get_subject(&self, id: TokenId) -> Option<&str> {
+        self.token_subjects.get(&id).map(String::as_str)
+    }
 
     /// Check if a token id has been revoked.
     pub fn is_revoked(&self, id: TokenId) -> bool {
@@ -337,6 +404,8 @@ impl TokenStore {
             active_access: self.active_access.clone(),
             active_refresh: self.active_refresh.clone(),
             revoked: self.revoked.clone(),
+            token_subjects: self.token_subjects.clone(),
+            paired_access: self.paired_access.clone(),
             next_id: self.next_id,
         }
     }
@@ -346,6 +415,8 @@ impl TokenStore {
         self.active_access = snap.active_access;
         self.active_refresh = snap.active_refresh;
         self.revoked = snap.revoked;
+        self.token_subjects = snap.token_subjects;
+        self.paired_access = snap.paired_access;
         self.next_id = snap.next_id;
     }
 }
@@ -550,5 +621,93 @@ mod tests {
         // New tokens are valid.
         assert!(store.verify_access(&new_pair.access).is_ok());
         assert!(store.active_refresh.contains(&new_pair.refresh.id));
+    }
+
+    #[test]
+    fn tenant_isolation_revoke_all_does_not_affect_other_tenants() {
+        let mut store = TokenStore::new();
+        let pair_a = store.issue_pair("tenant-a".into());
+        let pair_b = store.issue_pair("tenant-b".into());
+
+        // Revoke all tokens for tenant-a
+        store.revoke_all_for_subject("tenant-a");
+
+        // Tenant A tokens are revoked
+        assert!(store.is_revoked(pair_a.access.id));
+        assert!(store.is_revoked(pair_a.refresh.id));
+        assert!(store.active_access_ids_for_subject("tenant-a").is_empty());
+        assert!(store.active_refresh_ids_for_subject("tenant-a").is_empty());
+
+        // Tenant B tokens MUST remain untouched and valid
+        assert!(!store.is_revoked(pair_b.access.id));
+        assert!(!store.is_revoked(pair_b.refresh.id));
+        assert_eq!(store.active_access_ids_for_subject("tenant-b"), vec![pair_b.access.id]);
+        assert_eq!(store.active_refresh_ids_for_subject("tenant-b"), vec![pair_b.refresh.id]);
+        assert!(store.verify_access(&pair_b.access).is_ok());
+    }
+
+    #[test]
+    fn verify_access_for_subject_enforces_tenant_boundary() {
+        let mut store = TokenStore::new();
+        let pair = store.issue_pair("tenant-a".into());
+
+        // Matching subject succeeds
+        assert!(store.verify_access_for_subject(&pair.access, "tenant-a").is_ok());
+
+        // Mismatched subject is rejected
+        let err = store.verify_access_for_subject(&pair.access, "tenant-b").unwrap_err();
+        assert_eq!(err, AuthError::TokenInvalid("subject mismatch".into()));
+    }
+
+    #[test]
+    fn tampered_access_token_subject_rejected() {
+        let mut store = TokenStore::new();
+        let pair = store.issue_pair("tenant-a".into());
+
+        let mut tampered = pair.access.clone();
+        tampered.subject = "tenant-b".into();
+
+        let err = store.verify_access(&tampered).unwrap_err();
+        assert_eq!(err, AuthError::TokenInvalid("token subject mismatch".into()));
+    }
+
+    #[test]
+    fn cross_tenant_refresh_attempt_rejected_without_mutation() {
+        let mut store = TokenStore::new();
+        let pair_a = store.issue_pair("tenant-a".into());
+
+        let mut forged_refresh = pair_a.refresh.clone();
+        forged_refresh.subject = "tenant-b".into();
+
+        let res = store.refresh(&forged_refresh);
+        assert_eq!(
+            res,
+            Err(AuthError::TokenInvalid("refresh token subject mismatch".into()))
+        );
+
+        // Crucial invariant: rejected cross-tenant attempt produces zero mutation on Tenant A
+        assert!(!store.is_revoked(pair_a.access.id));
+        assert!(!store.is_revoked(pair_a.refresh.id));
+        assert!(store.verify_access(&pair_a.access).is_ok());
+    }
+
+    #[test]
+    fn tab_isolated_token_refresh_preserves_other_tab() {
+        let mut store = TokenStore::new();
+        let tab1 = store.issue_pair("user-1".into());
+        let tab2 = store.issue_pair("user-1".into());
+
+        // Refresh Tab 1
+        let tab1_refreshed = store.refresh(&tab1.refresh).unwrap();
+
+        // Tab 1's old tokens are revoked and new tokens are valid
+        assert!(store.is_revoked(tab1.refresh.id));
+        assert!(store.is_revoked(tab1.access.id));
+        assert!(store.verify_access(&tab1_refreshed.access).is_ok());
+
+        // Tab 2's tokens MUST remain active and valid (tab independence)
+        assert!(!store.is_revoked(tab2.access.id));
+        assert!(!store.is_revoked(tab2.refresh.id));
+        assert!(store.verify_access(&tab2.access).is_ok());
     }
 }
